@@ -1,430 +1,702 @@
-import time
+import os
+import uuid
 import random
+import logging
+import hashlib
 import datetime
-import pandas as pd
+import functools
+import sqlite3
+import time
+from typing import List, Dict, Any, Tuple, Optional
+
 import numpy as np
+import pandas as pd
+import joblib
 import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import accuracy_score, confusion_matrix
 
-from config import Config
-from database.db import get_db_connection, init_db
-from services.auth import AuthManager
-from services.monitoring import CloudMonitoring
-from services.load_balancer import LoadBalancerService
-from services.auto_scaler import AutoScalerService
-from services.simulator import LoadTestingSimulator
-from models.random_forest import RandomForestModelManager
-from utils.logger import logger
+# ==============================================================================
+# 1. CẤU HÌNH HỆ THỐNG (Config & Logger)
+# ==============================================================================
+class Config:
+    DB_DIR = "database"
+    DB_NAME = "cloud.db"
+    DB_PATH = os.path.join(DB_DIR, DB_NAME)
+    
+    MODEL_DIR = "model"
+    MODEL_NAME = "random_forest.pkl"
+    MODEL_PATH = os.path.join(MODEL_DIR, MODEL_NAME)
+    
+    DATA_DIR = "data"
+    TRAIN_DATA_PATH = os.path.join(DATA_DIR, "train_data.csv")
+    
+    CPU_HIGH_THRESHOLD = 80.0
+    RAM_HIGH_THRESHOLD = 80.0
+    CPU_LOW_THRESHOLD = 30.0
+    MAX_AUTO_SERVERS = 5
+    
+    FALLBACK_LEAST_CONN = "LEAST_CONNECTION"
+    FALLBACK_ROUND_ROBIN = "ROUND_ROBIN"
 
-# Khởi tạo bảng dữ liệu SQLite
+# Khởi tạo các thư mục lưu trữ cốt lõi
+for folder in [Config.DB_DIR, Config.MODEL_DIR, Config.DATA_DIR]:
+    os.makedirs(folder, exist_ok=True)
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger("CloudSystem")
+
+# ==============================================================================
+# 2. XỬ LÝ LỖI NGOẠI LỆ (Exception Handler)
+# ==============================================================================
+def safe_execution(fallback_value: Any):
+    def decorator(func):
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs):
+            try:
+                return func(*args, **kwargs)
+            except Exception as e:
+                logger.error(f"Lỗi thực thi trong hàm {func.__name__}: {str(e)}")
+                return fallback_value
+        return wrapper
+    return decorator
+
+# ==============================================================================
+# 3. CƠ SỞ DỮ LIỆU (Database Migration & Initializer)
+# ==============================================================================
+def get_connection():
+    conn = sqlite3.connect(Config.DB_PATH, timeout=10.0, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    # Tối ưu hóa SQLite cho môi trường làm việc đa luồng
+    conn.execute("PRAGMA journal_mode=WAL;")
+    return conn
+
+def init_db():
+    conn = get_connection()
+    cursor = conn.cursor()
+    
+    # Bảng người dùng (Phân quyền quản trị)
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS users (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        username TEXT UNIQUE NOT NULL,
+        password_hash TEXT NOT NULL,
+        role TEXT NOT NULL
+    )""")
+    
+    # Bảng giám sát tài nguyên các Node Máy chủ ảo
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS servers (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        cpu_usage REAL NOT NULL,
+        ram_usage REAL NOT NULL,
+        disk_usage REAL NOT NULL,
+        network_usage REAL NOT NULL,
+        queue_length INTEGER NOT NULL,
+        response_time REAL NOT NULL,
+        throughput REAL NOT NULL,
+        status TEXT NOT NULL,
+        timestamp TEXT NOT NULL
+    )""")
+    
+    # Bảng lưu lịch sử định tuyến Request
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS requests_log (
+        request_id TEXT PRIMARY KEY,
+        timestamp TEXT NOT NULL,
+        status TEXT NOT NULL,
+        allocated_server TEXT,
+        routing_method TEXT,
+        confidence_score REAL
+    )""")
+    
+    # Tạo các node máy chủ mặc định ban đầu nếu cơ sở dữ liệu trống
+    cursor.execute("SELECT COUNT(*) FROM servers")
+    if cursor.fetchone()[0] == 0:
+        now_str = datetime.datetime.now().isoformat()
+        default_servers = [
+            ("SRV-01", "Application Server 1", 45.0, 50.0, 30.0, 150.0, 5, 120.0, 450.0, "ONLINE", now_str),
+            ("SRV-02", "Application Server 2", 75.0, 82.0, 40.0, 300.0, 12, 280.0, 850.0, "ONLINE", now_str),
+            ("SRV-03", "Application Server 3", 20.0, 35.0, 25.0, 80.0, 1, 60.0, 120.0, "ONLINE", now_str),
+        ]
+        cursor.executemany("INSERT INTO servers VALUES (?,?,?,?,?,?,?,?,?,?,?)", default_servers)
+        
+    conn.commit()
+    conn.close()
+
+# ==============================================================================
+# 4. XÁC THỰC NGƯỜI DÙNG (Authentication)
+# ==============================================================================
+class AuthManager:
+    @staticmethod
+    def _hash_password(password: str) -> str:
+        return hashlib.sha256(password.encode('utf-8')).hexdigest()
+
+    @classmethod
+    def register_user(cls, username: str, password: str, role: str = "User") -> bool:
+        try:
+            conn = get_connection()
+            cursor = conn.cursor()
+            pwd_hash = cls._hash_password(password)
+            cursor.execute("INSERT INTO users (username, password_hash, role) VALUES (?, ?, ?)", 
+                           (username, pwd_hash, role))
+            conn.commit()
+            conn.close()
+            return True
+        except Exception:
+            return False
+
+    @classmethod
+    def authenticate(cls, username: str, password: str) -> Optional[Dict[str, Any]]:
+        conn = get_connection()
+        cursor = conn.cursor()
+        pwd_hash = cls._hash_password(password)
+        cursor.execute("SELECT username, role FROM users WHERE username = ? AND password_hash = ?", 
+                       (username, pwd_hash))
+        row = cursor.fetchone()
+        conn.close()
+        if row:
+            return {"username": row["username"], "role": row["role"]}
+        return None
+
+# ==============================================================================
+# 5. GIÁM SÁT HẠ TẦNG & METADATA (Monitoring & Data Engineering)
+# ==============================================================================
+class CloudMonitoring:
+    def collect_realtime_metrics(self) -> List[Dict[str, Any]]:
+        """Cập nhật và trả về chỉ số thời gian thực từ DB mà không sử dụng cache có tác dụng phụ"""
+        conn = get_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM servers")
+        rows = cursor.fetchall()
+        
+        metrics = []
+        for row in rows:
+            # Mô phỏng sự biến thiên liên tục của tài nguyên mạng Cloud
+            cpu_delta = random.uniform(-6.0, 6.0)
+            new_cpu = max(5.0, min(100.0, row["cpu_usage"] + cpu_delta))
+            
+            ram_delta = random.uniform(-4.0, 4.0)
+            new_ram = max(10.0, min(100.0, row["ram_usage"] + ram_delta))
+            
+            new_queue = max(0, int(row["queue_length"] + random.choice([-2, -1, 0, 1, 2])))
+            new_rt = new_queue * random.uniform(15.0, 30.0) + 12.0
+            new_tp = new_cpu * random.uniform(7.0, 11.0)
+            
+            timestamp = datetime.datetime.now().isoformat()
+            
+            cursor.execute("""
+                UPDATE servers 
+                SET cpu_usage=?, ram_usage=?, queue_length=?, response_time=?, throughput=?, timestamp=?
+                WHERE id=?
+            """, (new_cpu, new_ram, new_queue, new_rt, new_tp, timestamp, row["id"]))
+            
+            metrics.append({
+                "id": row["id"], 
+                "name": row["name"], 
+                "cpu_usage": new_cpu, 
+                "ram_usage": new_ram,
+                "disk_usage": row["disk_usage"], 
+                "network_usage": row["network_usage"],
+                "queue_length": new_queue, 
+                "response_time": new_rt, 
+                "throughput": new_tp,
+                "status": row["status"], 
+                "timestamp": timestamp
+            })
+            
+        conn.commit()
+        conn.close()
+        return metrics
+
+# ==============================================================================
+# 6. MÔ HÌNH TRÍ TUỆ NHÂN TẠO RANDOM FOREST (Core Machine Learning)
+# ==============================================================================
+class RandomForestModelManager:
+    def __init__(self):
+        self.model_path = Config.MODEL_PATH
+        self.clf = RandomForestClassifier(n_estimators=100, criterion='gini', random_state=42)
+
+    def generate_synthetic_train_data(self):
+        np.random.seed(42)
+        records = 600
+        
+        # Lấy danh sách server hiện tại để gán nhãn chính xác
+        conn = get_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT id FROM servers WHERE status = 'ONLINE'")
+        server_ids = [r['id'] for r in cursor.fetchall()]
+        conn.close()
+        
+        if not server_ids:
+            server_ids = ["SRV-01", "SRV-02", "SRV-03"]
+
+        data = {
+            'cpu_usage': np.random.uniform(10, 95, records),
+            'ram_usage': np.random.uniform(15, 95, records),
+            'disk_usage': np.random.uniform(20, 80, records),
+            'network_usage': np.random.uniform(50, 500, records),
+            'queue_length': np.random.randint(0, 40, records),
+            'response_time': np.random.uniform(10, 400, records),
+            'throughput': np.random.uniform(100, 1000, records),
+        }
+        df = pd.DataFrame(data)
+        
+        # Gán nhãn server tối ưu dựa trên chỉ số tải tổng hợp
+        labels = []
+        for _, row in df.iterrows():
+            if row['cpu_usage'] < 40 and row['queue_length'] < 8:
+                labels.append(server_ids[-1] if len(server_ids) >= 3 else server_ids[0])
+            elif row['cpu_usage'] < 75:
+                labels.append(server_ids[0])
+            else:
+                labels.append(server_ids[1] if len(server_ids) >= 2 else server_ids[0])
+        df['best_server'] = labels
+        df.to_csv(Config.TRAIN_DATA_PATH, index=False)
+
+    def train_and_save(self) -> dict:
+        if not os.path.exists(Config.TRAIN_DATA_PATH):
+            self.generate_synthetic_train_data()
+            
+        df = pd.read_csv(Config.TRAIN_DATA_PATH)
+        feature_cols = ['cpu_usage', 'ram_usage', 'disk_usage', 'network_usage', 'queue_length', 'response_time', 'throughput']
+        X = df[feature_cols]
+        y = df['best_server']
+        
+        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+        
+        self.clf.fit(X_train, y_train)
+        preds = self.clf.predict(X_test)
+        
+        metrics = {
+            "accuracy": float(accuracy_score(y_test, preds)),
+            "feature_importances": dict(zip(X.columns, [float(val) for val in self.clf.feature_importances_])),
+            "matrix": confusion_matrix(y_test, preds).tolist()
+        }
+        
+        joblib.dump(self.clf, self.model_path)
+        # Làm mới Streamlit resource cache nếu có
+        st.cache_resource.clear()
+        return metrics
+
+    def load_model(self) -> RandomForestClassifier:
+        if not os.path.exists(self.model_path):
+            self.train_and_save()
+        return joblib.load(self.model_path)
+
+@st.cache_resource
+def get_cached_model():
+    """Tải và lưu cache mô hình RF trong bộ nhớ RAM để tối ưu tốc độ dự đoán"""
+    manager = RandomForestModelManager()
+    return manager.load_model()
+
+# ==============================================================================
+# 7. CÂN BẰNG TẢI THÔNG MINH & ĐIỀU PHỐI (Load Balancer & Allocator Engine)
+# ==============================================================================
+class LoadBalancerCore:
+    def __init__(self):
+        self.model_manager = RandomForestModelManager()
+        self.rr_index = 0
+
+    def _get_active_servers(self) -> list:
+        conn = get_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM servers WHERE status = 'ONLINE'")
+        servers = cursor.fetchall()
+        conn.close()
+        return servers
+
+    @safe_execution(fallback_value=(None, "CRITICAL_FALLBACK", 0.0))
+    def route_request(self, current_metrics: dict) -> Tuple[Optional[str], str, float]:
+        active_servers = self._get_active_servers()
+        if not active_servers:
+            return None, "CRITICAL_FALLBACK", 0.0
+            
+        server_ids = [s["id"] for s in active_servers]
+        features = [
+            current_metrics.get('cpu_usage', 50.0), current_metrics.get('ram_usage', 50.0),
+            current_metrics.get('disk_usage', 50.0), current_metrics.get('network_usage', 100.0),
+            current_metrics.get('queue_length', 0), current_metrics.get('response_time', 50.0),
+            current_metrics.get('throughput', 200.0)
+        ]
+        
+        # 1. Thử nghiệm định tuyến lớp lõi AI (Random Forest)
+        try:
+            model = get_cached_model()
+            arr = np.array(features).reshape(1, -1)
+            pred = model.predict(arr)[0]
+            probs = model.predict_proba(arr)[0]
+            confidence = float(np.max(probs))
+            
+            if pred in server_ids:
+                return str(pred), "RANDOM_FOREST", confidence
+        except Exception as e:
+            logger.warning(f"RF Prediction bypassed: {e}")
+            
+        # 2. Phòng vệ tầng 2: Least Connection (Chọn server có queue_length nhỏ nhất)
+        try:
+            least_conn_srv = min(active_servers, key=lambda x: (x["queue_length"], x["cpu_usage"]))
+            return str(least_conn_srv["id"]), Config.FALLBACK_LEAST_CONN, 0.75
+        except Exception:
+            # 3. Phòng vệ tầng cuối: Round Robin
+            srv_target = server_ids[self.rr_index % len(server_ids)]
+            self.rr_index = (self.rr_index + 1) % len(server_ids)
+            return str(srv_target), Config.FALLBACK_ROUND_ROBIN, 0.50
+
+class RequestManager:
+    @staticmethod
+    def log_request(allocated_server: str, method: str, conf: float) -> str:
+        conn = get_connection()
+        cursor = conn.cursor()
+        req_id = f"REQ-{uuid.uuid4().hex[:8].upper()}"
+        ts = datetime.datetime.now().isoformat()
+        
+        cursor.execute("""
+            INSERT INTO requests_log (request_id, timestamp, status, allocated_server, routing_method, confidence_score)
+            VALUES (?, ?, 'PROCESSED', ?, ?, ?)
+        """, (req_id, ts, allocated_server, method, conf))
+        
+        cursor.execute("UPDATE servers SET queue_length = queue_length + 1 WHERE id = ?", (allocated_server,))
+        conn.commit()
+        conn.close()
+        return req_id
+
+# ==============================================================================
+# 8. TỰ ĐỘNG CO GIÃN HẠ TẦNG & THỐNG KÊ (Auto-Scaling & Stats)
+# ==============================================================================
+class AutoScaler:
+    @staticmethod
+    def check_and_scale(avg_cpu: float) -> str:
+        conn = get_connection()
+        cursor = conn.cursor()
+        
+        # Đếm số node tự động co giãn hiện tại
+        cursor.execute("SELECT COUNT(*) FROM servers WHERE id LIKE 'SRV-AUTO-%'")
+        auto_count = cursor.fetchone()[0]
+        
+        if avg_cpu > Config.CPU_HIGH_THRESHOLD:
+            if auto_count < Config.MAX_AUTO_SERVERS:
+                new_id = f"SRV-AUTO-{random.randint(10,99)}"
+                cursor.execute("""
+                    INSERT INTO servers VALUES (?, 'Dynamic Auto-Scale Node', 25.0, 30.0, 20.0, 60.0, 0, 25.0, 150.0, 'ONLINE', ?)
+                """, (new_id, datetime.datetime.now().isoformat()))
+                conn.commit()
+                conn.close()
+                return f"🚨 Tải Cluster cao ({avg_cpu:.1f}%)! Hệ thống đã kích hoạt Node mới: {new_id}"
+            else:
+                conn.close()
+                return f"⚠️ Tải Cluster cao ({avg_cpu:.1f}%), nhưng đã đạt giới hạn tối đa ({Config.MAX_AUTO_SERVERS}) Node Auto-Scale."
+            
+        elif avg_cpu < Config.CPU_LOW_THRESHOLD:
+            cursor.execute("SELECT id FROM servers WHERE id LIKE 'SRV-AUTO-%' LIMIT 1")
+            target = cursor.fetchone()
+            if target:
+                node_id = target['id']
+                cursor.execute("DELETE FROM servers WHERE id = ?", (node_id,))
+                conn.commit()
+                conn.close()
+                return f"♻️ Tải hạ tầng thấp ({avg_cpu:.1f}%). Đã giải phóng bớt Node: {node_id}"
+                
+        conn.close()
+        return f"✅ Hạ tầng hoạt động ổn định (CPU trung bình: {avg_cpu:.1f}%)."
+
+class StatisticsManager:
+    @staticmethod
+    def get_kpis() -> dict:
+        conn = get_connection()
+        df_req = pd.read_sql_query("SELECT * FROM requests_log", conn)
+        df_srv = pd.read_sql_query("SELECT * FROM servers", conn)
+        conn.close()
+        
+        total = len(df_req)
+        avg_cpu = float(df_srv['cpu_usage'].mean()) if not df_srv.empty else 0.0
+        avg_ram = float(df_srv['ram_usage'].mean()) if not df_srv.empty else 0.0
+        avg_rt = float(df_srv['response_time'].mean()) if not df_srv.empty else 0.0
+        
+        return {
+            "total_requests": total,
+            "avg_cpu": avg_cpu,
+            "avg_ram": avg_ram,
+            "avg_response_time": avg_rt,
+            "server_count": len(df_srv)
+        }
+
+# ==============================================================================
+# 9. GIAO DIỆN ĐỒ HỌA ĐIỀU KHIỂN TẬP TRUNG (Streamlit Main App)
+# ==============================================================================
+# Khởi tạo DB ban đầu
 init_db()
 
-# Cấu hình trang Streamlit
 st.set_page_config(
-    page_title="Cloud Resource Management & Load Balancer",
+    page_title="Cloud Resource Allocator using RF",
     layout="wide",
     page_icon="☁️",
     initial_sidebar_state="expanded"
 )
 
-# Custom CSS giao diện hiện đại Glassmorphic
+# Custom CSS cho giao diện giao diện hiện đại & chuyển động mượt mà
 st.markdown("""
 <style>
-    .metric-container {
+    .main {
+        background-color: #0e1117;
+    }
+    .metric-card {
         background: rgba(255, 255, 255, 0.05);
         border: 1px solid rgba(255, 255, 255, 0.1);
-        border-radius: 10px;
-        padding: 15px;
-        box-shadow: 0 4px 12px rgba(0, 0, 0, 0.2);
+        border-radius: 12px;
+        padding: 18px;
+        backdrop-filter: blur(10px);
+        box-shadow: 0 4px 20px rgba(0, 0, 0, 0.3);
     }
-    .status-online { color: #10b981; font-weight: bold; }
-    .status-offline { color: #ef4444; font-weight: bold; }
-    .status-maint { color: #f59e0b; font-weight: bold; }
+    .stMetric label {
+        color: #94a3b8 !important;
+        font-weight: 600;
+    }
+    .stMetric div[data-testid="stMetricValue"] {
+        color: #38bdf8 !important;
+        font-weight: 700;
+    }
 </style>
 """, unsafe_allow_html=True)
 
-# Khởi tạo trạng thái phiên làm việc (Session State)
+# Khai báo Session State cho người dùng
 if "authenticated" not in st.session_state:
     st.session_state["authenticated"] = True
     st.session_state["username"] = "admin"
     st.session_state["role"] = "Admin"
 
-# Thanh Sidebar Điều hướng chính
-st.sidebar.title("☁️ Cloud Manager & ML Balancer")
-st.sidebar.caption("Hệ thống Giám sát, Cân bằng Tải AI & Co giãn Hạ tầng")
+# THANH MENU ĐIỀU HƯỚNG BÊN TRÁI (Sidebar)
+st.sidebar.title("☁️ Cloud ML-Balancer")
+st.sidebar.caption("Intelligent Multi-Agent & Machine Learning Load Balancing System")
 st.sidebar.markdown("---")
 st.sidebar.write(f"👤 **Tài khoản:** `{st.session_state['username']}`")
 st.sidebar.write(f"🛡️ **Quyền hạn:** `{st.session_state['role']}`")
 st.sidebar.markdown("---")
 
 menu = st.sidebar.radio("📋 Menu Chức Năng", [
-    "Dashboard Giám sát Tải",
-    "Quản lý Server Nodes",
-    "Mô phỏng Load Testing",
-    "Performance Comparison",
-    "Auto Scaling Visualization",
-    "Đánh giá Mô hình AI (ML)",
-    "Lịch sử Request History",
-    "Cấu hình Hệ thống"
+    "Dashboard Giám sát Tải", 
+    "Điều hướng Khách hàng (Load Balancer)", 
+    "Huấn luyện Mô hình AI", 
+    "Lịch sử Nhật ký Hệ thống"
 ])
 
-monitoring = CloudMonitoring()
-lb_service = LoadBalancerService()
-rf_manager = RandomForestModelManager()
-simulator = LoadTestingSimulator()
+# KHỞI TẠO ĐỐI TƯỢNG ĐIỀU PHỐI VÀ THEO DÕI
+monitor = CloudMonitoring()
+lb_engine = LoadBalancerCore()
 
-# ==============================================================================
-# 1. REAL-TIME DASHBOARD (Giám sát chỉ số thời gian thực)
-# ==============================================================================
+# --------------------------------------------------------------------------
+# CHỨC NĂNG 1: DASHBOARD GIÁM SÁT TẢI THỜI GIAN THỰC
+# --------------------------------------------------------------------------
 if menu == "Dashboard Giám sát Tải":
-    st.title("📊 Real-time Cloud Infrastructure Dashboard")
-    st.caption("Cập nhật tự động các chỉ số hạ tầng đám mây: CPU, RAM, Disk, Network, Throughput, Response Time, Active Requests.")
+    st.title("📊 Real-Time Cloud Infrastructure Dashboard")
+    st.caption("Giám sát trạng thái hoạt động thực tế của các Node máy chủ ảo theo thời gian thực.")
     
-    col_refresh1, col_refresh2 = st.columns([1, 4])
-    with col_refresh1:
-        auto_refresh = st.checkbox("🔄 Auto-Refresh (3s)", value=False)
-    with col_refresh2:
-        if st.button("⚡ làm mới ngay"):
+    # Auto refresh switch
+    col_ctrl1, col_ctrl2 = st.columns([1, 4])
+    with col_ctrl1:
+        auto_refresh = st.checkbox("🔄 Tự động làm mới", value=False)
+    with col_ctrl2:
+        if st.button("⚡ Làm mới dữ liệu ngay"):
             st.rerun()
-
-    metrics = monitoring.collect_realtime_metrics()
-    df_servers = pd.DataFrame(metrics)
-    summary = monitoring.get_cluster_summary()
-
-    # Thẻ KPI chính
-    kpi1, kpi2, kpi3, kpi4, kpi5 = st.columns(5)
-    kpi1.metric("Node Hoạt Động", f"{summary['server_count']} Nodes")
-    kpi2.metric("CPU Cluster TB", f"{summary['avg_cpu']:.1f}%")
-    kpi3.metric("RAM Cluster TB", f"{summary['avg_ram']:.1f}%")
-    kpi4.metric("Thời Gian Phản Hồi", f"{summary['avg_response_time']:.1f} ms")
-    kpi5.metric("Tổng Throughput", f"{summary['total_throughput']:.1f} req/s")
-
+            
+    # Lấy dữ liệu động và tính toán KPI
+    servers_list = monitor.collect_realtime_metrics()
+    df_servers = pd.DataFrame(servers_list)
+    kpis = StatisticsManager.get_kpis()
+    
+    # Hiển thị các Widget thẻ số liệu KPI
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Tổng Requests Đã Xử Lý", kpis["total_requests"])
+    c2.metric("Số Node Đang Online", kpis["server_count"])
+    c3.metric("CPU Cluster Trung Bình", f"{kpis['avg_cpu']:.1f}%")
+    c4.metric("Thời gian phản hồi TB", f"{kpis['avg_response_time']:.1f} ms")
+    
     st.markdown("---")
-    st.subheader("🖥️ Trạng thái Chi tiết các Máy Chủ Áo (Virtual Server Nodes)")
-
-    if not df_servers.empty:
-        st.dataframe(
-            df_servers[['id', 'name', 'status', 'cpu_usage', 'ram_usage', 'disk_usage', 'network_usage', 'queue_length', 'response_time', 'throughput', 'timestamp']],
-            use_container_width=True,
-            column_config={
-                "cpu_usage": st.column_config.ProgressColumn("CPU (%)", format="%.1f%%", min_value=0, max_value=100),
-                "ram_usage": st.column_config.ProgressColumn("RAM (%)", format="%.1f%%", min_value=0, max_value=100),
-                "disk_usage": st.column_config.ProgressColumn("Disk (%)", format="%.1f%%", min_value=0, max_value=100),
-                "response_time": st.column_config.NumberColumn("Response Time (ms)", format="%.1f ms"),
-                "throughput": st.column_config.NumberColumn("Throughput (req/s)", format="%.1f")
-            }
+    st.subheader("🖥️ Trạng thái chi tiết Virtual Nodes")
+    
+    # Custom format cho dataframe
+    st.dataframe(
+        df_servers[['id', 'name', 'cpu_usage', 'ram_usage', 'queue_length', 'response_time', 'throughput', 'status', 'timestamp']], 
+        use_container_width=True,
+        column_config={
+            "cpu_usage": st.column_config.ProgressColumn("CPU (%)", format="%.1f%%", min_value=0, max_value=100),
+            "ram_usage": st.column_config.ProgressColumn("RAM (%)", format="%.1f%%", min_value=0, max_value=100),
+            "response_time": st.column_config.NumberColumn("Response Time (ms)", format="%.1f ms"),
+            "throughput": st.column_config.NumberColumn("Throughput (req/s)", format="%.1f"),
+        }
+    )
+    
+    # Biểu đồ Plotly trực quan hóa tài nguyên
+    st.markdown("### 📈 Biểu đồ Trực quan hóa Tiêu thụ Tài nguyên")
+    fig_col1, fig_col2 = st.columns(2)
+    
+    with fig_col1:
+        fig_cpu = px.bar(
+            df_servers, x='id', y='cpu_usage', color='cpu_usage',
+            title='Tỷ lệ Sử dụng CPU từng Node (%)', text_auto='.1f',
+            color_continuous_scale='Reds'
         )
-
-        st.markdown("### 📈 Biểu đồ Tiêu thụ Tài nguyên Cluster")
-        c_chart1, c_chart2 = st.columns(2)
-        with c_chart1:
-            fig_cpu = px.bar(df_servers, x='id', y='cpu_usage', color='cpu_usage', title='Mức Tiêu Thụ CPU (%)', color_continuous_scale='Reds')
-            fig_cpu.update_layout(template="plotly_dark")
-            st.plotly_chart(fig_cpu, use_container_width=True)
-
-        with c_chart2:
-            fig_ram = px.bar(df_servers, x='id', y='ram_usage', color='ram_usage', title='Mức Tiêu Thụ RAM (%)', color_continuous_scale='Blues')
-            fig_ram.update_layout(template="plotly_dark")
-            st.plotly_chart(fig_ram, use_container_width=True)
-
-    # Kiểm tra Auto-Scaling
-    scale_summary, scale_events = AutoScalerService.check_and_scale(summary['avg_cpu'])
-    for ev in scale_events:
-        if ev['type'] == 'SCALE_UP':
-            st.warning(f"🚨 {ev['message']}")
-        elif ev['type'] == 'SCALE_DOWN':
-            st.info(f"♻️ {ev['message']}")
-
+        fig_cpu.update_layout(template="plotly_dark")
+        st.plotly_chart(fig_cpu, use_container_width=True)
+        
+    with fig_col2:
+        fig_ram = px.bar(
+            df_servers, x='id', y='ram_usage', color='ram_usage',
+            title='Tỷ lệ Sử dụng RAM từng Node (%)', text_auto='.1f',
+            color_continuous_scale='Blues'
+        )
+        fig_ram.update_layout(template="plotly_dark")
+        st.plotly_chart(fig_ram, use_container_width=True)
+    
+    # Kiểm tra tự động co giãn hạ tầng (Auto Scaling)
+    scale_message = AutoScaler.check_and_scale(kpis["avg_cpu"])
+    st.info(scale_message)
+    
     if auto_refresh:
-        time.sleep(3)
+        time.sleep(2)
         st.rerun()
 
-# ==============================================================================
-# 2. SERVER MANAGEMENT (Quản lý các Node máy chủ)
-# ==============================================================================
-elif menu == "Quản lý Server Nodes":
-    st.title("🖥️ Quản lý Máy chủ Áo (Server Nodes Management)")
-    st.write("Thêm mới, xóa máy chủ hoặc cập nhật trạng thái hoạt động (`ONLINE`, `OFFLINE`, `MAINTENANCE`).")
-
-    conn = get_db_connection()
-    cursor = conn.cursor()
+# --------------------------------------------------------------------------
+# CHỨC NĂNG 2: ĐIỀU HƯỚNG KHÁCH HÀNG (LOAD BALANCER)
+# --------------------------------------------------------------------------
+elif menu == "Điều hướng Khách hàng (Load Balancer)":
+    st.title("🔀 Định tuyến & Cân bằng Tải Thông minh")
+    st.write("Mô phỏng lưu lượng truy cập của client gửi tới hệ thống đám mây. Cơ chế phòng vệ 3 lớp: **Random Forest ML -> Least Connection -> Round Robin**.")
     
-    # Form Thêm Server Mới
-    with st.expander("➕ Thêm Máy Chủ Áo Mới", expanded=False):
-        with st.form("add_server_form"):
-            new_id = st.text_input("Mã Server ID", value=f"SRV-{random.randint(10,99)}")
-            new_name = st.text_input("Tên Server", value="Application Server Custom")
-            status_opt = st.selectbox("Trạng thái", ["ONLINE", "OFFLINE", "MAINTENANCE"])
-            submitted = st.form_submit_button("Thêm Máy Chủ")
-            
-            if submitted:
-                try:
-                    now_str = datetime.datetime.now().isoformat()
-                    cursor.execute("""
-                        INSERT INTO servers VALUES (?, ?, 30.0, 40.0, 25.0, 100.0, 0, 50.0, 200.0, ?, ?)
-                    """, (new_id, new_name, status_opt, now_str))
-                    conn.commit()
-                    st.success(f"Đã thêm máy chủ mới: {new_id} ({new_name})")
-                    st.rerun()
-                except Exception as e:
-                    st.error(f"Không thể thêm máy chủ: {e}")
-
-    cursor.execute("SELECT * FROM servers")
-    servers_db = cursor.fetchall()
-    conn.close()
-
-    st.subheader("📋 Danh Sách Máy Chủ Hiện Tại")
-    for s in servers_db:
-        col_s1, col_s2, col_s3, col_s4, col_s5 = st.columns([2, 3, 2, 2, 2])
-        with col_s1:
-            st.write(f"**{s['id']}**")
-        with col_s2:
-            st.write(s['name'])
-        with col_s3:
-            if s['status'] == 'ONLINE':
-                st.markdown("<span class='status-online'>🟢 ONLINE</span>", unsafe_allow_html=True)
-            elif s['status'] == 'OFFLINE':
-                st.markdown("<span class='status-offline'>🔴 OFFLINE</span>", unsafe_allow_html=True)
-            else:
-                st.markdown("<span class='status-maint'>🟡 MAINTENANCE</span>", unsafe_allow_html=True)
-        with col_s4:
-            new_st = st.selectbox("Đổi trạng thái", ["ONLINE", "OFFLINE", "MAINTENANCE"], index=["ONLINE", "OFFLINE", "MAINTENANCE"].index(s['status']), key=f"sel_{s['id']}")
-            if new_st != s['status']:
-                conn_u = get_db_connection()
-                conn_u.execute("UPDATE servers SET status = ? WHERE id = ?", (new_st, s['id']))
-                conn_u.commit()
-                conn_u.close()
-                st.success(f"Đã đổi {s['id']} sang {new_st}")
-                st.rerun()
-        with col_s5:
-            if st.button("🗑️ Xóa Node", key=f"del_{s['id']}"):
-                conn_d = get_db_connection()
-                conn_d.execute("DELETE FROM servers WHERE id = ?", (s['id'],))
-                conn_d.commit()
-                conn_d.close()
-                st.success(f"Đã xóa {s['id']}")
-                st.rerun()
-
-# ==============================================================================
-# 3. LOAD TESTING SIMULATOR (Mô phỏng tải song song)
-# ==============================================================================
-elif menu == "Mô phỏng Load Testing":
-    st.title("🚀 Load Test Simulation")
-    st.write("Sinh luồng client requests đồng thời (10, 100, 500, 1000 requests) đi qua Load Balancer, cập nhật tài nguyên server và ghi nhật ký vào SQLite.")
-
-    col_btn1, col_btn2, col_btn3, col_btn4 = st.columns(4)
-    run_10 = col_btn1.button("🔥 Generate 10 Requests", use_container_width=True)
-    run_100 = col_btn2.button("🚀 Generate 100 Requests", use_container_width=True)
-    run_500 = col_btn3.button("⚡ Generate 500 Requests", use_container_width=True)
-    run_1000 = col_btn4.button("💥 Generate 1000 Requests", use_container_width=True)
-
-    target_count = 0
-    if run_10: target_count = 10
-    elif run_100: target_count = 100
-    elif run_500: target_count = 500
-    elif run_1000: target_count = 1000
-
-    if target_count > 0:
-        st.markdown(f"### ⚙️ Đang thực thi Load Test với **{target_count} Requests**...")
-        progress_bar = st.progress(0.0)
-        status_text = st.empty()
-
-        def update_progress(ratio):
-            progress_bar.progress(ratio)
-            status_text.text(f"Tiến độ: {ratio*100:.1f}%")
-
-        sim_res = simulator.run_simulation(count=target_count, progress_callback=update_progress)
-
-        st.success(f"🎉 Hoàn thành Load Test {target_count} requests trong {sim_res['total_time_seconds']:.2f} giây!")
+    col_sim1, col_sim2 = st.columns([2, 1])
+    with col_sim1:
+        st.markdown("#### ⚙️ Thông số Request Mô phỏng")
+        req_cpu = st.slider("Mức độ tiêu tốn CPU yêu cầu (%)", 10.0, 100.0, 45.0)
+        req_ram = st.slider("Mức độ tiêu tốn RAM yêu cầu (%)", 10.0, 100.0, 50.0)
+        req_queue = st.slider("Độ dài hàng đợi hiện tại (Queue Length)", 0, 50, 5)
         
-        c_r1, c_r2, c_r3, c_r4 = st.columns(4)
-        c_r1.metric("Requests Thành Công", f"{sim_res['successful_requests']} / {target_count}")
-        c_r2.metric("Tỷ Lệ Thành Công", f"{sim_res['success_rate']:.1f}%")
-        c_r3.metric("Response Time TB", f"{sim_res['avg_response_time']:.1f} ms")
-        c_r4.metric("Throughput Đạt Được", f"{sim_res['throughput_req_per_sec']:.1f} req/s")
+    with col_sim2:
+        st.markdown("#### 🚀 Gửi Yêu cầu")
+        send_btn = st.button("🔥 Gửi Client Request Tự động", use_container_width=True)
+        send_custom_btn = st.button("🎯 Gửi Request với Thông số trên", use_container_width=True)
 
-        st.markdown("### 📊 Phân phối Tải trọng giữa các Nodes (Load Distribution)")
-        df_dist = pd.DataFrame(list(sim_res['load_distribution'].items()), columns=['Server Node', 'Số Requests Đã Nhận'])
-        fig_dist = px.pie(df_dist, values='Số Requests Đã Nhận', names='Server Node', title='Tỷ lệ Phân bổ Tải trọng theo Node')
-        fig_dist.update_layout(template="plotly_dark")
-        st.plotly_chart(fig_dist, use_container_width=True)
-
-# ==============================================================================
-# 4. PERFORMANCE COMPARISON (So sánh hiệu năng 3 thuật toán)
-# ==============================================================================
-elif menu == "Performance Comparison":
-    st.title("⚖️ Performance Comparison Page")
-    st.write("So sánh đối đầu trực tiếp giữa 3 thuật toán: **Random Forest AI**, **Round Robin** và **Least Connection**.")
-
-    col_comp_ctrl1, col_comp_ctrl2 = st.columns([3, 1])
-    with col_comp_ctrl1:
-        test_size = st.slider("Số lượng requests kiểm thử cho mỗi thuật toán", 20, 500, 100)
-    with col_comp_ctrl2:
-        btn_start_comp = st.button("🏋️ Chạy So Sánh Đối Đầu", use_container_width=True)
-
-    if btn_start_comp:
-        with st.spinner("Đang chạy mô phỏng đo đạc hiệu năng cả 3 thuật toán..."):
-            comp_data = simulator.compare_algorithms(req_count_per_algo=test_size)
+    if send_btn or send_custom_btn:
+        if send_btn:
+            mock_metrics = {
+                'cpu_usage': random.uniform(15, 95),
+                'ram_usage': random.uniform(20, 90),
+                'disk_usage': 45.0,
+                'network_usage': random.uniform(80, 450),
+                'queue_length': random.randint(1, 25),
+                'response_time': random.uniform(50, 250),
+                'throughput': 400.0
+            }
+        else:
+            mock_metrics = {
+                'cpu_usage': req_cpu,
+                'ram_usage': req_ram,
+                'disk_usage': 45.0,
+                'network_usage': 250.0,
+                'queue_length': req_queue,
+                'response_time': req_queue * 20.0 + 15.0,
+                'throughput': 500.0
+            }
             
-            # Chuẩn bị dữ liệu bảng
-            rows = []
-            for algo, res in comp_data.items():
-                rows.append({
-                    "Algorithm": algo,
-                    "Avg Response Time (ms)": res["avg_response_time"],
-                    "Throughput (req/s)": res["throughput_req_per_sec"],
-                    "CPU Utilization (%)": res["avg_cpu_utilization"],
-                    "Success Rate (%)": res["success_rate"]
-                })
-            df_comp = pd.DataFrame(rows)
-            st.dataframe(df_comp, use_container_width=True)
+        target_node, method_used, score = lb_engine.route_request(mock_metrics)
+        if target_node:
+            req_id = RequestManager.log_request(target_node, method_used, score)
+            
+            st.success(f"✅ Yêu cầu xử lý thành công! Mã Request: **{req_id}**")
+            
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                st.metric("Node được Phân bổ", target_node)
+            with col2:
+                st.metric("Thuật toán Sử dụng", method_used)
+            with col3:
+                st.metric("Độ tin cậy AI (Confidence)", f"{score * 100:.1f}%")
+                
+            st.markdown("### 📋 Kế hoạch Cấp phát Tài nguyên Chi tiết")
+            allocation_plan = {
+                "request_id": req_id,
+                "target_node": target_node,
+                "routing_strategy": method_used,
+                "confidence_score": f"{score:.4f}",
+                "cpu_allocation": "High_Performance" if mock_metrics['cpu_usage'] < 70 else "Boost_Emergency",
+                "allocated_ram_mb": 4096 if mock_metrics['ram_usage'] > 60 else 2048,
+                "status": "PROCESSED"
+            }
+            st.json(allocation_plan)
+        else:
+            st.error("❌ Không thể phân bổ Node! Kiểm tra lại kết nối cơ sở dữ liệu hoặc trạng thái máy chủ.")
 
-            st.markdown("### 📊 Biểu đồ So sánh Trực quan")
-            c_comp1, c_comp2 = st.columns(2)
-            with c_comp1:
-                fig_rt = px.bar(df_comp, x='Algorithm', y='Avg Response Time (ms)', color='Algorithm', title='Thời Gian Phản Hồi Thấp Nhất (Tối Ưu)')
-                fig_rt.update_layout(template="plotly_dark")
-                st.plotly_chart(fig_rt, use_container_width=True)
+# --------------------------------------------------------------------------
+# CHỨC NĂNG 3: HUẤN LUYỆN MÔ HÌNH AI (RANDOM FOREST)
+# --------------------------------------------------------------------------
+elif menu == "Huấn luyện Mô hình AI":
+    st.title("🧠 Trung tâm Huấn luyện & Tối ưu Mô hình Random Forest")
+    st.write("Hệ thống phân tích các tập dữ liệu lịch sử tải, xây dựng các cây quyết định song song và tính toán mức độ quan trọng của từng thuộc tính.")
+    
+    rf_manager = RandomForestModelManager()
+    
+    col_t1, col_t2 = st.columns([3, 1])
+    with col_t1:
+        st.info("Mô hình Random Forest sẽ học cách phân bổ lưu lượng tối ưu dựa trên CPU, RAM, Queue Length, Response Time và Throughput.")
+    with col_t2:
+        train_btn = st.button("🏋️ Huấn luyện lại (Retrain)", use_container_width=True)
 
-            with c_comp2:
-                fig_tp = px.bar(df_comp, x='Algorithm', y='Throughput (req/s)', color='Algorithm', title='Throughput Xử Lý Cao Nhất')
-                fig_tp.update_layout(template="plotly_dark")
-                st.plotly_chart(fig_tp, use_container_width=True)
-
-# ==============================================================================
-# 5. AUTO SCALING VISUALIZATION (Trực quan hóa Co giãn Hạ tầng)
-# ==============================================================================
-elif menu == "Auto Scaling Visualization":
-    st.title("📈 Auto Scaling Visualization")
-    st.write("Trực quan hóa quá trình Tự động Cấp phát Node mới (CPU > 80%) và Giải phóng Node nhàn rỗi (CPU < 20%).")
-
-    summary = monitoring.get_cluster_summary()
-    st.info(f"📊 **Cluster Trạng thái Hiện tại**: {summary['server_count']} Nodes ONLINE | CPU Cluster Trung Bình: **{summary['avg_cpu']:.1f}%**")
-
-    # Hiển thị thẻ danh sách Cụm hiện tại
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute("SELECT id, name, cpu_usage, status FROM servers WHERE status = 'ONLINE'")
-    current_nodes = cursor.fetchall()
-    conn.close()
-
-    st.markdown("#### 🖥️ Danh Sách Node Trong Cluster Hiện Tại:")
-    cols_nodes = st.columns(min(6, max(1, len(current_nodes))))
-    for idx, node in enumerate(current_nodes):
-        with cols_nodes[idx % len(cols_nodes)]:
-            st.metric(node['id'], f"CPU: {node['cpu_usage']:.1f}%", delta="ONLINE")
-
-    st.markdown("---")
-    st.subheader("📜 Lịch sử Các Sự Kiện Co Giãn (Scaling Events Log)")
-    history = AutoScalerService.get_scaling_history(limit=20)
-    if history:
-        df_hist = pd.DataFrame(history)
-        st.dataframe(df_hist[['id', 'event_type', 'server_id', 'reason', 'cpu_avg', 'cluster_size', 'timestamp']], use_container_width=True)
-        
-        fig_scale = px.line(df_hist, x='timestamp', y='cluster_size', markers=True, title='Biến thiên Quy mô Cluster Size Theo Thời Gian')
-        fig_scale.update_layout(template="plotly_dark")
-        st.plotly_chart(fig_scale, use_container_width=True)
-    else:
-        st.info("Chưa có sự kiện co giãn nào được ghi nhận.")
-
-# ==============================================================================
-# 6. MACHINE LEARNING EVALUATION (Đánh giá chi tiết mô hình AI)
-# ==============================================================================
-elif menu == "Đánh giá Mô hình AI (ML)":
-    st.title("🧠 Đánh giá Mô hình Machine Learning (Random Forest)")
-    st.write("Hiển thị các chỉ số kiểm thử nâng cao: **Accuracy, Precision, Recall, F1 Score, Confusion Matrix, Classification Report, Feature Importances**.")
-
-    if st.button("🏋️ Retrain & Re-Evaluate Model"):
-        with st.spinner("Đang huấn luyện và tính toán chỉ số đánh giá..."):
-            rf_manager.train_and_save()
-            st.success("Đã hoàn tất huấn luyện lại mô hình!")
-
-    try:
-        metrics = rf_manager.train_and_save()
-        c_ml1, c_ml2, c_ml3, c_ml4 = st.columns(4)
-        c_ml1.metric("Accuracy Score", f"{metrics['accuracy']*100:.2f}%")
-        c_ml2.metric("Precision (Weighted)", f"{metrics['precision']*100:.2f}%")
-        c_ml3.metric("Recall (Weighted)", f"{metrics['recall']*100:.2f}%")
-        c_ml4.metric("F1 Score (Weighted)", f"{metrics['f1_score']*100:.2f}%")
-
-        st.markdown("---")
-        c_eval1, c_eval2 = st.columns(2)
-        with c_eval1:
-            st.markdown("### 📊 Confusion Matrix Heatmap")
-            cm = np.array(metrics['confusion_matrix'])
-            fig_cm = px.imshow(cm, text_auto=True, color_continuous_scale='Blues', title='Confusion Matrix', labels=dict(x="Predicted Server", y="Actual Server"))
-            fig_cm.update_layout(template="plotly_dark")
-            st.plotly_chart(fig_cm, use_container_width=True)
-
-        with c_eval2:
-            st.markdown("### 🌟 Feature Importance Ranking")
-            df_imp = pd.DataFrame(list(metrics['feature_importances'].items()), columns=['Thuộc tính', 'Độ quan trọng']).sort_values(by='Độ quan trọng', ascending=True)
-            fig_imp = px.bar(df_imp, x='Độ quan trọng', y='Thuộc tính', orientation='h', color='Độ quan trọng', title='Feature Importance')
+    if train_btn:
+        with st.spinner("Đang trích xuất dữ liệu, tối ưu hóa các node quyết định..."):
+            metrics = rf_manager.train_and_save()
+            st.balloons()
+            st.success(f"🎯 Huấn luyện thành công! Độ chính xác (Accuracy): **{metrics['accuracy']*100:.2f}%**")
+            
+            st.markdown("### 📊 Mức độ Quan trọng Thuộc tính (Feature Importance)")
+            df_imp = pd.DataFrame(
+                list(metrics['feature_importances'].items()), 
+                columns=['Thuộc tính', 'Độ quan trọng']
+            ).sort_values(by='Độ quan trọng', ascending=True)
+            
+            fig_imp = px.bar(
+                df_imp, x='Độ quan trọng', y='Thuộc tính', orientation='h',
+                color='Độ quan trọng', color_continuous_scale='Viridis',
+                title="Feature Importance Ranking"
+            )
             fig_imp.update_layout(template="plotly_dark")
             st.plotly_chart(fig_imp, use_container_width=True)
 
-        st.markdown("### 📋 Classification Report Chi tiết")
-        st.json(metrics['classification_report'])
-    except Exception as e:
-        st.error(f"Chưa có dữ liệu đánh giá mô hình: {e}")
-
-# ==============================================================================
-# 7. REQUEST HISTORY (Lịch sử định tuyến)
-# ==============================================================================
-elif menu == "Lịch sử Request History":
-    st.title("📜 Lịch sử Định tuyến Requests (Request History)")
-    st.write("Bảng tra cứu lịch sử chi tiết tất cả các requests đã được gửi và xử lý bởi hệ thống Cân bằng tải.")
-
-    conn = get_db_connection()
-    df_logs = pd.read_sql_query("SELECT * FROM requests_log ORDER BY timestamp DESC", conn)
+# --------------------------------------------------------------------------
+# CHỨC NĂNG 4: LỊCH SỬ NHẬT KÝ HỆ THỐNG
+# --------------------------------------------------------------------------
+elif menu == "Lịch sử Nhật ký Hệ thống":
+    st.title("📜 Nhật ký Hệ thống & Lịch sử Định tuyến")
+    st.write("Tra cứu lịch sử phân phối yêu cầu và dấu vết định tuyến lưu trong Cơ sở dữ liệu SQLite:")
+    
+    conn = get_connection()
+    df_logs = pd.read_sql_query("SELECT * FROM requests_log ORDER BY timestamp DESC LIMIT 200", conn)
     conn.close()
-
-    if not df_logs.empty:
-        col_f1, col_f2 = st.columns(2)
-        with col_f1:
-            search_query = st.text_input("🔍 Tìm kiếm theo Request ID hoặc Server Node", "")
-        with col_f2:
-            method_filter = st.multiselect("Lọc theo Thuật toán Routing", df_logs['routing_method'].unique().tolist())
-
+    
+    if df_logs.empty:
+        st.info("Chưa có lịch sử định tuyến nào được ghi nhận.")
+    else:
+        c_filter1, c_filter2 = st.columns(2)
+        with c_filter1:
+            method_filter = st.multiselect("Lọc theo Thuật toán", options=df_logs['routing_method'].unique().tolist())
+        with c_filter2:
+            server_filter = st.multiselect("Lọc theo Server", options=df_logs['allocated_server'].unique().tolist())
+            
         filtered_df = df_logs.copy()
-        if search_query:
-            filtered_df = filtered_df[
-                filtered_df['request_id'].str.contains(search_query, case=False, na=False) |
-                filtered_df['allocated_server'].str.contains(search_query, case=False, na=False)
-            ]
         if method_filter:
             filtered_df = filtered_df[filtered_df['routing_method'].isin(method_filter)]
-
+        if server_filter:
+            filtered_df = filtered_df[filtered_df['allocated_server'].isin(server_filter)]
+            
         st.dataframe(filtered_df, use_container_width=True)
-
+        
+        # Nút tải xuống CSV
         csv_data = filtered_df.to_csv(index=False).encode('utf-8')
         st.download_button(
-            label="📥 Tải xuống Nhật ký Lịch sử (CSV)",
+            label="📥 Tải xuống Nhật ký (CSV)",
             data=csv_data,
-            file_name="cloud_request_history.csv",
+            file_name="requests_log.csv",
             mime="text/csv"
         )
-    else:
-        st.info("Chưa có dữ liệu nhật ký request nào.")
-
-# ==============================================================================
-# 8. CẤU HÌNH HỆ THỐNG
-# ==============================================================================
-elif menu == "Cấu hình Hệ thống":
-    st.title("⚙️ System Settings & Thresholds")
-    st.write("Điều chỉnh cấu hình các ngưỡng tự động co giãn và thông số hệ thống.")
-
-    with st.form("settings_form"):
-        cpu_high = st.slider("Ngưỡng CPU Auto Scale Up (%)", 50.0, 95.0, Config.CPU_HIGH_THRESHOLD)
-        cpu_low = st.slider("Ngưỡng CPU Auto Scale Down (%)", 5.0, 40.0, Config.CPU_LOW_THRESHOLD)
-        max_servers = st.number_input("Số lượng Server tối đa", min_value=2, max_value=20, value=Config.MAX_SERVERS)
-        min_servers = st.number_input("Số lượng Server tối thiểu", min_value=1, max_value=5, value=Config.MIN_SERVERS)
-        
-        save_btn = st.form_submit_button("Lưu Cấu Hình")
-        if save_btn:
-            Config.CPU_HIGH_THRESHOLD = cpu_high
-            Config.CPU_LOW_THRESHOLD = cpu_low
-            Config.MAX_SERVERS = max_servers
-            Config.MIN_SERVERS = min_servers
-            st.success("Đã cập nhật cấu hình hệ thống thành công!")
