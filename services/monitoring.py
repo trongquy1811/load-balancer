@@ -56,7 +56,7 @@ class CloudMonitoring:
         conn.close()
         return metrics
 
-    def get_cluster_summary((self) -> Dict[str, Any]:
+    def get_cluster_summary(self) -> Dict[str, Any]:
         """Tính toán tổng quan chỉ số toàn cụm máy chủ."""
         conn = get_db_connection()
         cursor = conn.cursor()
