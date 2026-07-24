@@ -1,225 +1,84 @@
-# Cloud Resource Management using Random Forest
+# ☁️ Cloud Resource Manager & Intelligent Load Balancer Simulation Suite
 
-## Overview
-
-Cloud Resource Management using Random Forest is a simulation-based cloud load balancing system developed with **Python**, **Streamlit**, **SQLite**, and **Scikit-learn**.
-
-The project applies a **Random Forest Machine Learning model** to predict the most suitable server for incoming client requests based on real-time server metrics. To improve reliability, the system also includes fallback load balancing algorithms such as **Least Connection** and **Round Robin**.
-
-The application provides a web dashboard for monitoring server resources, training the machine learning model, simulating request routing, and viewing request logs.
+Dự án Mô phỏng Quản lý Tài nguyên Hạ tầng Đám mây, Cân bằng Tải Thông minh dựa trên Machine Learning (**Random Forest Classifier**), Tự động Co giãn Hạ tầng (**Auto Scaling**) và Giao diện **Streamlit** kết hợp **FastAPI REST API**.
 
 ---
 
-## Features
+## 🌟 5 Tính Năng Mở Rộng Nổi Bật (Core Extended Features)
 
-- Real-time cloud infrastructure monitoring
-- Intelligent load balancing using Random Forest
-- Automatic model training and prediction
-- Least Connection fallback strategy
-- Round Robin fallback strategy
-- SQLite database for server and request management
-- Auto Scaling simulation based on CPU utilization
-- Interactive dashboard with Streamlit and Plotly
-- Request logging and performance statistics
+### 1. 🚀 Load Test Simulation (Mô phỏng Tải Song Song)
+- Cung cấp các nút khởi tạo nhanh: **Generate 10 Requests**, **100 Requests**, **500 Requests**, và **1000 Requests**.
+- Xử lý đồng thời đa luồng (Multi-threading) qua 3 bộ cân bằng tải: Random Forest AI, Least Connection, Round Robin.
+- Cập nhật số liệu máy chủ thời gian thực, lưu vết nhật ký vào cơ sở dữ liệu SQLite và hiển thị thanh tiến trình trực quan.
 
----
+### 2. ⚖️ Performance Comparison Page (So sánh Hiệu năng Thuật toán)
+- So sánh đối đầu trực tiếp 3 thuật toán: **Random Forest AI**, **Least Connection**, và **Round Robin**.
+- Trực quan hóa bằng biểu đồ Plotly: **Average Response Time**, **Throughput**, **CPU Utilization**, **Load Distribution**, và **Success Rate**.
 
-## System Architecture
+### 3. 📈 Auto Scaling Visualization (Trực quan hóa Co giãn Hạ tầng)
+- Quản lý cụm máy chủ thời gian thực (`Node 1`, `Node 2`, ...).
+- **Scale Up (CPU > 80%)**: Tự động tạo thêm Node máy chủ mới và hiển thị thông báo `"New server has been created."`.
+- **Scale Down (CPU < 20%)**: Tự động giải phóng Node nhàn rỗi và hiển thị thông báo `"Server has been removed."`.
+- Biểu đồ Plotly diễn biến quy mô Cluster và lịch sử các sự kiện co giãn.
 
-```
-                Client Request
-                      │
-                      ▼
-          Resource Information Collection
-      (CPU, RAM, Network, Queue, Response Time)
-                      │
-                      ▼
-          Random Forest Prediction Model
-                      │
-        ┌─────────────┴─────────────┐
-        │                           │
- Prediction Success          Prediction Failed
-        │                           │
-        ▼                           ▼
- Select Best Server         Least Connection
-                                    │
-                                    ▼
-                               Round Robin
-                                    │
-                                    ▼
-                           Request Logging
-                                    │
-                                    ▼
-                              Dashboard
-```
+### 4. ⚡ REST API sử dụng FastAPI
+- Cung cấp dịch vụ backend RESTful với các endpoint chuẩn Pydantic JSON:
+  - `GET /servers`: Trích xuất danh sách tất cả các server nodes.
+  - `GET /metrics`: Trích xuất chỉ số tổng quan toàn cụm.
+  - `POST /predict`: Dự đoán máy chủ tối ưu bằng mô hình Random Forest.
+  - `POST /requests`: Khởi tạo và định tuyến client request mới.
+  - `POST /train`: Huấn luyện lại mô hình Machine Learning.
+  - `GET /history`: Truy vấn nhật ký lịch sử request.
+
+### 5. 📚 Tự Động Tạo Tài Liệu API (Swagger UI & ReDoc)
+- **Swagger UI Interactive**: `http://localhost:8000/docs`
+- **ReDoc Documentation**: `http://localhost:8000/redoc`
 
 ---
 
-## Technologies Used
+## 🚀 Hướng Dẫn Chạy Ứng Dụng (Quick Start)
 
-- Python 3.11
-- Streamlit
-- Scikit-learn
-- Random Forest Classifier
-- Pandas
-- NumPy
-- Plotly
-- SQLite
-- Joblib
-
----
-
-## Project Structure
-
-```
-load-balancer/
-│
-├── app.py
-├── requirements.txt
-├── README.md
-│
-├── data/
-│   └── train_data.csv
-│
-├── database/
-│   └── cloud.db
-│
-├── model/
-│   └── random_forest.pkl
-│
-└── assets/
-```
-
----
-
-## Installation
-
-Clone the repository:
-
-```bash
-git clone https://github.com/trongquy1811/load-balancer.git
-cd load-balancer
-```
-
-Create a virtual environment:
-
-```bash
-python -m venv .venv
-```
-
-Activate the environment:
-
-Windows
-
-```bash
-.venv\Scripts\activate
-```
-
-Linux / macOS
-
-```bash
-source .venv/bin/activate
-```
-
-Install dependencies:
-
+### 1. Cài đặt các thư viện phụ thuộc:
 ```bash
 pip install -r requirements.txt
 ```
 
----
-
-## Run the Application
-
+### 2. Chạy ứng dụng Giao diện Streamlit Dashboard:
 ```bash
 streamlit run app.py
 ```
+Ứng dụng sẽ chạy tại địa chỉ: `http://localhost:8501`
 
-The application will be available at:
+### 3. Chạy dịch vụ Backend FastAPI REST API:
+```bash
+uvicorn api.main:app --reload
+```
+Dịch vụ REST API sẽ chạy tại địa chỉ: `http://localhost:8000`  
+Xem tài liệu Swagger UI tại: `http://localhost:8000/docs`
+
+---
+
+## 📁 Cấu Trúc Thư Mục Dự Án (Project Architecture)
 
 ```
-http://localhost:8501
+load-balancer/
+├── app.py               # Giao diện chính Streamlit Dashboard
+├── config.py            # Cấu hình tham số và ngưỡng hệ thống
+├── requirements.txt     # Danh sách phụ thuộc Python
+├── README.md            # Tài liệu hướng dẫn sử dụng
+│
+├── database/            # Quản lý kết nối & schema SQLite
+│   └── db.py
+├── models/              # Mô hình Machine Learning Random Forest
+│   └── random_forest.py
+├── services/            # Tầng xử lý nghiệp vụ Cloud Services
+│   ├── auth.py          # Quản lý người dùng
+│   ├── monitoring.py    # Giám sát chỉ số realtime
+│   ├── load_balancer.py # Bộ cân bằng tải 3 tầng
+│   ├── auto_scaler.py   # Bộ tự động co giãn hạ tầng
+│   └── simulator.py     # Bộ mô phỏng tải song song
+├── api/                 # Tầng REST API với FastAPI
+│   └── main.py
+└── utils/               # Công cụ hỗ trợ và Logging
+    └── logger.py
 ```
-
----
-
-## Machine Learning Model
-
-The system uses a **Random Forest Classifier** to predict the optimal server for handling incoming requests.
-
-### Input Features
-
-- CPU Usage
-- RAM Usage
-- Disk Usage
-- Network Usage
-- Queue Length
-- Response Time
-- Throughput
-
-### Output
-
-- Selected Server ID
-- Prediction Confidence
-
----
-
-## Load Balancing Strategy
-
-Priority order:
-
-1. Random Forest Prediction
-2. Least Connection
-3. Round Robin
-
-This multi-layer approach ensures high availability even if the machine learning model cannot make a prediction.
-
----
-
-## Dashboard
-
-The Streamlit dashboard provides:
-
-- Server status monitoring
-- CPU and RAM visualization
-- Request statistics
-- Auto Scaling status
-- Machine learning training interface
-- Request history
-
----
-
-## Database
-
-SQLite stores:
-
-- User accounts
-- Server information
-- Request logs
-
----
-
-## Future Improvements
-
-- Replace simulated data with real cloud metrics
-- Deploy on AWS or Azure
-- Integrate Docker and Kubernetes
-- Add REST API using FastAPI
-- Support Reinforcement Learning for adaptive load balancing
-- Real-time monitoring with Prometheus and Grafana
-
----
-
-## Author
-
-**Nguyen Trong Quy**
-
-Bachelor of Information Technology
-
-University of Science
-
----
-
-## License
-
-This project is intended for educational and research purposes.
